@@ -1,0 +1,122 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  PYTHON_VERSION: "3.9"
+  IMAGE_NAME: sakila-app
+  MYSQL_HOST: 127.0.0.1
+  MYSQL_PORT: "3306"
+  MYSQL_USER: root
+  MYSQL_PASSWORD: admin
+  MYSQL_DB: sakila
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install flake8
+        run: pip install flake8
+      - name: Run flake8
+        run: flake8 . --max-line-length=120 --ignore=E501,W503
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    needs: lint
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: admin
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -padmin"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Install MySQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mysql-client
+      - name: Wait for MySQL and import Sakila schema
+        run: |
+          for i in {1..30}; do
+            mysql -h "${MYSQL_HOST}" -P "${MYSQL_PORT}" -u"${MYSQL_USER}" -p"${MYSQL_PASSWORD}" -e "SELECT 1;" && break
+            echo "Waiting for MySQL..."
+            sleep 2
+          done
+          curl -L -o sakila-db.tar.gz https://downloads.mysql.com/docs/sakila-db.tar.gz
+          tar -xzf sakila-db.tar.gz
+          mysql -h "${MYSQL_HOST}" -P "${MYSQL_PORT}" -u"${MYSQL_USER}" -p"${MYSQL_PASSWORD}" -e "CREATE DATABASE IF NOT EXISTS ${MYSQL_DB};"
+          mysql -h "${MYSQL_HOST}" -P "${MYSQL_PORT}" -u"${MYSQL_USER}" -p"${MYSQL_PASSWORD}" "${MYSQL_DB}" < sakila-db/sakila-schema.sql
+          mysql -h "${MYSQL_HOST}" -P "${MYSQL_PORT}" -u"${MYSQL_USER}" -p"${MYSQL_PASSWORD}" "${MYSQL_DB}" < sakila-db/sakila-data.sql
+      - name: Run tests
+        env:
+          MYSQL_HOST: ${{ env.MYSQL_HOST }}
+          MYSQL_USER: ${{ env.MYSQL_USER }}
+          MYSQL_PASSWORD: ${{ env.MYSQL_PASSWORD }}
+          MYSQL_DB: ${{ env.MYSQL_DB }}
+        run: pytest -v
+
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        run: docker build -t ${IMAGE_NAME}:${{ github.sha }} .
+      - name: Verify image exists
+        run: docker images | grep ${IMAGE_NAME}
+      - name: Smoke test container
+        run: |
+          docker run -d --name smoke-test -p 5000:5000 ${IMAGE_NAME}:${{ github.sha }}
+          sleep 10
+          curl -f http://127.0.0.1:5000 || (docker logs smoke-test && exit 1)
+          docker rm -f smoke-test
+
+  security-scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image for scan
+        run: docker build -t ${IMAGE_NAME}:${{ github.sha }} .
+      - name: Run Trivy scan (non-blocking)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: table
+          output: trivy-report.txt
+          exit-code: "0"
+      - name: Upload Trivy artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report
+          path: trivy-report.txt
