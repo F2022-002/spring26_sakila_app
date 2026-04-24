@@ -1,4 +1,4 @@
-FROM python:3.9-slim
+FROM python:3.9.19-slim
 
 LABEL maintainer="saimi" \
       version="1.0.0" \
